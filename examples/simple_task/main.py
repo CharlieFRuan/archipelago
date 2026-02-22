@@ -22,8 +22,28 @@ import uuid
 import zipfile
 from pathlib import Path
 
+import atexit
+import signal
+
 import requests
 import shutil
+
+_env_process = None
+
+
+def _cleanup_env():
+    """Kill the environment process on exit."""
+    global _env_process
+    if _env_process is not None:
+        _env_process.terminate()
+        try:
+            _env_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _env_process.kill()
+        _env_process = None
+
+
+atexit.register(_cleanup_env)
 
 # Paths - can be overridden via environment variables
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
@@ -56,7 +76,7 @@ def wait_for_health(url: str, timeout: int = 120) -> bool:
 
 
 def start_environment():
-    """Start a fresh environment container (always restarts)."""
+    """Start the environment as a local process (no Docker needed)."""
     # Ensure .env file exists (copy from .env.example if needed)
     env_file = ENVIRONMENT_DIR / ".env"
     env_example = ENVIRONMENT_DIR / ".env.example"
@@ -67,31 +87,51 @@ def start_environment():
         log("Creating empty .env file...")
         env_file.touch()
 
-    # Always stop and remove existing containers for a fresh start
-    log("Stopping any existing environment containers...")
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
+    # Check if environment is already running
+    try:
+        resp = requests.get(f"{ENV_URL}/health", timeout=2)
+        if resp.status_code == 200:
+            log("Environment already running")
+            return
+    except requests.RequestException:
+        pass
+
+    # Create subsystem directories
+    os.makedirs("/filesystem", exist_ok=True)
+    os.makedirs("/.apps_data", exist_ok=True)
+
+    # Start environment as local background process
+    log("Starting environment server locally...")
+    env_vars = os.environ.copy()
+    env_vars["APP_FS_ROOT"] = "/filesystem"
+    env_vars["GUI_ENABLED"] = "true"
+    env_vars["INTERNET_ENABLED"] = "false"
+    env_vars["HAS_STATE"] = "true"
+    env_vars["STATE_LOCATION"] = "/.apps_data/chat"
+
+    env_process = subprocess.Popen(
+        ["uv", "run", "uvicorn", "runner.main:app", "--host", "0.0.0.0", "--port", "8080"],
         cwd=ENVIRONMENT_DIR,
-        capture_output=True,
+        env=env_vars,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
-    log("Building and starting fresh environment container...")
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--build"],
-        cwd=ENVIRONMENT_DIR,
-    )
-    if result.returncode != 0:
-        log("ERROR: Failed to start environment")
-        sys.exit(1)
+    # Store the process so we can clean up later
+    global _env_process
+    _env_process = env_process
 
     log("Waiting for environment to be healthy...")
     if not wait_for_health(ENV_URL):
-        # Show logs on failure to help debug
-        subprocess.run(["docker", "compose", "logs"], cwd=ENVIRONMENT_DIR)
         log("ERROR: Environment failed to start")
+        # Print any stderr output for debugging
+        if env_process.stderr:
+            stderr_output = env_process.stderr.read()
+            if stderr_output:
+                log(f"Environment stderr: {stderr_output.decode()[:2000]}")
         sys.exit(1)
 
-    log("Environment started")
+    log("Environment started (local process)")
 
 
 def zip_to_tar_gz(zip_path: Path, strip_prefix: str = "filesystem/") -> Path:

@@ -1,4 +1,7 @@
 {
-  "model": "gemini/gemini-3-pro-preview",
-  "extra_args": {}
+  "model": "openai/Qwen/Qwen3-30B-A3B",
+  "extra_args": {
+    "api_base": "http://0.0.0.0:8000/v1",
+    "api_key": "dummy"
+  }
 }
