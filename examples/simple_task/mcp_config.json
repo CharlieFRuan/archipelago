@@ -8,7 +8,7 @@
         "python",
         "main.py"
       ],
-      "cwd": "/home/ray/default/archipelago/mcp_servers/filesystem/mcp_servers/filesystem_server",
+      "cwd": "/app/mcp_servers/filesystem/mcp_servers/filesystem_server",
       "env": {
         "APP_FS_ROOT": "/filesystem",
         "SERVER_NAME": "filesystem_server",
