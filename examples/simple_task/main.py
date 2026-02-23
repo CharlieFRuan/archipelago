@@ -38,10 +38,9 @@ ENVIRONMENT_DIR = Path(
 )
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
-MCP_SERVERS_DIR = ARCHIPELAGO_DIR / "mcp_servers"
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://0.0.0.0:8000/v1")
-VLLM_MODEL = os.environ.get("VLLM_MODEL", "openai/Qwen/Qwen3-30B-A3B")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "openai/Qwen/Qwen3-VL-30B-A3B-Thinking")
 
 
 def log(msg: str):
@@ -49,56 +48,19 @@ def log(msg: str):
 
 
 def _ignore_filter(path: Path) -> bool:
-    """Return True to IGNORE (exclude) files from Modal image upload."""
-    excluded_dirs = {
-        ".venv", "__pycache__", ".git", ".ruff_cache",
-        ".pytest_cache", "node_modules", ".mypy_cache",
-    }
-    if any(p in excluded_dirs for p in path.parts):
-        return True
-    if path.name == ".env":
-        return True
-    return False
+    """Return True to IGNORE (exclude) files from the Modal build context."""
+    excluded = {".venv", "__pycache__", ".git", ".ruff_cache", ".pytest_cache", ".mypy_cache"}
+    return any(p in excluded for p in path.parts)
 
 
 def build_modal_image() -> modal.Image:
-    """Build the Modal image for the environment sandbox."""
-    log("Building Modal image...")
-    image = (
-        modal.Image.debian_slim(python_version="3.13")
-        .apt_install("curl", "git", "build-essential")
-        .run_commands(
-            "curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh"
-        )
-        .workdir("/app")
-        .add_local_dir(
-            str(ENVIRONMENT_DIR),
-            remote_path="/app",
-            ignore=_ignore_filter,
-            copy=True,
-        )
-        .add_local_dir(
-            str(MCP_SERVERS_DIR / "filesystem"),
-            remote_path="/app/mcp_servers/filesystem",
-            ignore=_ignore_filter,
-            copy=True,
-        )
-        .run_commands(
-            "cd /app && uv sync",
-            "cd /app/mcp_servers/filesystem/mcp_servers/filesystem_server && uv sync --all-extras",
-            "mkdir -p /filesystem /.apps_data",
-        )
-        .env({
-            "PATH": "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin",
-            "UV_SYSTEM_PYTHON": "1",
-            "APP_FS_ROOT": "/filesystem",
-            "GUI_ENABLED": "true",
-            "INTERNET_ENABLED": "false",
-            "HAS_STATE": "true",
-            "STATE_LOCATION": "/.apps_data/chat",
-        })
+    """Build the Modal image from the environment Dockerfile."""
+    log("Building Modal image from Dockerfile...")
+    return modal.Image.from_dockerfile(
+        ENVIRONMENT_DIR / "Dockerfile",
+        context_dir=ARCHIPELAGO_DIR,
+        ignore=_ignore_filter,
     )
-    return image
 
 
 def wait_for_health(url: str, timeout: int = 180) -> bool:
@@ -156,17 +118,24 @@ def zip_to_tar_gz(zip_path: Path, strip_prefix: str = "filesystem/") -> Path:
     with zipfile.ZipFile(zip_path, "r") as zf:
         with tarfile.open(tar_gz_path, "w:gz") as tar:
             for name in zf.namelist():
+                # Strip the prefix if present
                 new_name = name
                 if strip_prefix and name.startswith(strip_prefix):
-                    new_name = name[len(strip_prefix):]
+                    new_name = name[len(strip_prefix) :]
+
+                # Skip empty names (the prefix directory itself)
                 if not new_name:
                     continue
+
                 info = tarfile.TarInfo(name=new_name)
+
+                # Check if it's a directory (ends with /)
                 if name.endswith("/"):
                     info.type = tarfile.DIRTYPE
                     info.mode = 0o755
                     tar.addfile(info)
                 else:
+                    # It's a file
                     data = zf.read(name)
                     info.size = len(data)
                     info.mode = 0o644
@@ -176,9 +145,10 @@ def zip_to_tar_gz(zip_path: Path, strip_prefix: str = "filesystem/") -> Path:
 
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     """Convert tar.gz to zip for grading."""
-    stem = tar_gz_path.stem
+    # Handle .tar.gz double suffix: strip both before adding .zip
+    stem = tar_gz_path.stem  # "file.tar" from "file.tar.gz"
     if stem.endswith(".tar"):
-        stem = stem[:-4]
+        stem = stem[:-4]  # "file" from "file.tar"
     zip_path = tar_gz_path.parent / f"{stem}.zip"
     with tarfile.open(tar_gz_path, "r:gz") as tar:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -227,7 +197,7 @@ def main():
         with open(EXAMPLE_DIR / "mcp_config.json") as f:
             mcp_config = json.load(f)
 
-        resp = requests.post(f"{env_url}/apps", json=mcp_config, timeout=120)
+        resp = requests.post(f"{env_url}/apps", json=mcp_config, timeout=300)
         resp.raise_for_status()
         log(f"MCP servers configured: {resp.json()}")
 
@@ -329,4 +299,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with modal.enable_output():
+        main()
