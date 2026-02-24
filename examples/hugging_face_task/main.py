@@ -245,9 +245,6 @@ def main():
         mcp_config = json.load(f)
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
-    # Skip code_execution_server — its proot sandbox library fails in Modal
-    mcp_config["mcpServers"].pop("code_execution_server", None)
-
     for attempt in range(3):
         resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
         if resp.status_code == 200:
