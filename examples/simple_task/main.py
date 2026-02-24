@@ -58,7 +58,11 @@ def _cleanup_sandbox():
         try:
             _sandbox.terminate()
         except Exception:
-            pass  # May fail during interpreter shutdown; Modal auto-terminates on timeout
+            print(
+                f"WARNING: Failed to terminate sandbox {_sandbox.object_id}. "
+                f"It will auto-terminate after its timeout (30 min).",
+                flush=True,
+            )
         _sandbox = None
 
 
