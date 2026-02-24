@@ -2,10 +2,6 @@
 """
 Run the simple_task example end-to-end.
 
-The environment (MCP gateway) runs in a Modal Sandbox.
-The agent and grading run locally, connecting to the sandbox via tunnel URL.
-The LLM (vLLM) runs locally.
-
 Usage:
     cd archipelago/agents
     uv run python ../examples/simple_task/main.py
@@ -16,6 +12,7 @@ Prerequisites:
     - uv installed, agents and grading deps installed (uv sync)
 """
 
+import atexit
 import io
 import json
 import os
@@ -42,6 +39,8 @@ GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 VLLM_URL = os.environ.get("VLLM_URL", "http://0.0.0.0:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "openai/Qwen/Qwen3-VL-30B-A3B-Thinking")
 
+_sandbox = None
+
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -53,14 +52,14 @@ def _ignore_filter(path: Path) -> bool:
     return any(p in excluded for p in path.parts)
 
 
-def build_modal_image() -> modal.Image:
-    """Build the Modal image from the environment Dockerfile."""
-    log("Building Modal image from Dockerfile...")
-    return modal.Image.from_dockerfile(
-        ENVIRONMENT_DIR / "Dockerfile",
-        context_dir=ARCHIPELAGO_DIR,
-        ignore=_ignore_filter,
-    )
+def _cleanup_sandbox():
+    global _sandbox
+    if _sandbox is not None:
+        _sandbox.terminate()
+        _sandbox = None
+
+
+atexit.register(_cleanup_sandbox)
 
 
 def wait_for_health(url: str, timeout: int = 180) -> bool:
@@ -77,13 +76,21 @@ def wait_for_health(url: str, timeout: int = 180) -> bool:
     return False
 
 
-def start_environment() -> tuple[modal.Sandbox, str]:
-    """Start the environment in a Modal Sandbox. Returns (sandbox, url)."""
-    image = build_modal_image()
+def start_environment():
+    """Start the environment in a Modal Sandbox. Returns the tunnel URL."""
+    global _sandbox
+
+    log("Building Modal image from Dockerfile...")
+    image = modal.Image.from_dockerfile(
+        ENVIRONMENT_DIR / "Dockerfile",
+        context_dir=ARCHIPELAGO_DIR,
+        ignore=_ignore_filter,
+    )
+
     app = modal.App.lookup("archipelago-env", create_if_missing=True)
 
     log("Creating Modal sandbox...")
-    sandbox = modal.Sandbox.create(
+    _sandbox = modal.Sandbox.create(
         "uv", "run", "uvicorn", "runner.main:app",
         "--host", "0.0.0.0", "--port", "8080",
         app=app,
@@ -91,21 +98,18 @@ def start_environment() -> tuple[modal.Sandbox, str]:
         encrypted_ports=[8080],
         timeout=30 * 60,
     )
+    log(f"Sandbox created: {_sandbox.object_id}")
 
-    log(f"Sandbox created: {sandbox.object_id}")
-
-    tunnel = sandbox.tunnels()[8080]
-    env_url = tunnel.url
+    env_url = _sandbox.tunnels()[8080].url
     log(f"Environment URL: {env_url}")
 
     log("Waiting for environment to be healthy...")
     if not wait_for_health(env_url):
-        log("ERROR: Environment failed to start in Modal sandbox")
-        sandbox.terminate()
+        log("ERROR: Environment failed to start")
         sys.exit(1)
-    log("Environment is healthy!")
 
-    return sandbox, env_url
+    log("Environment started")
+    return env_url
 
 
 def zip_to_tar_gz(zip_path: Path, strip_prefix: str = "filesystem/") -> Path:
@@ -165,132 +169,153 @@ def main():
     grading_run_id = f"gr_{uuid.uuid4().hex[:8]}"
 
     log("=" * 60)
-    log("SIMPLE TASK EXAMPLE (Modal Sandbox)")
+    log("SIMPLE TASK EXAMPLE")
     log("=" * 60)
     log(f"Trajectory ID: {trajectory_id}")
-    log(f"vLLM URL: {VLLM_URL}")
-    log(f"Model: {VLLM_MODEL}")
 
-    # Start environment in Modal
-    sandbox, env_url = start_environment()
+    # Start environment
+    ENV_URL = start_environment()
 
-    try:
-        # Populate world snapshot
-        log("Populating environment with world snapshot...")
-        original_zip = EXAMPLE_DIR / "original_snapshot.zip"
-        world_tar_gz = zip_to_tar_gz(original_zip)
+    # Load and populate world snapshot
+    log("Populating environment with world snapshot...")
+    original_zip = EXAMPLE_DIR / "original_snapshot.zip"
+    world_tar_gz = zip_to_tar_gz(original_zip)
 
-        with open(world_tar_gz, "rb") as f:
-            resp = requests.post(
-                f"{env_url}/data/populate",
-                files={"archive": ("world.tar.gz", f, "application/gzip")},
-                params={"subsystem": "filesystem"},
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                log(f"ERROR: Failed to populate: {resp.status_code} {resp.text}")
-                sys.exit(1)
-            log(f"Populated: {resp.json()}")
+    with open(world_tar_gz, "rb") as f:
+        resp = requests.post(
+            f"{ENV_URL}/data/populate",
+            files={"archive": ("world.tar.gz", f, "application/gzip")},
+            params={"subsystem": "filesystem"},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            log(f"ERROR: Failed to populate environment: {resp.status_code}")
+            log(f"Response: {resp.text}")
+            sys.exit(1)
+        log(f"Populated: {resp.json()}")
 
-        # Configure MCP servers
-        log("Configuring MCP servers...")
-        with open(EXAMPLE_DIR / "mcp_config.json") as f:
-            mcp_config = json.load(f)
+    # Configure MCP servers
+    log("Configuring MCP servers...")
+    with open(EXAMPLE_DIR / "mcp_config.json") as f:
+        mcp_config = json.load(f)
 
-        resp = requests.post(f"{env_url}/apps", json=mcp_config, timeout=300)
-        resp.raise_for_status()
-        log(f"MCP servers configured: {resp.json()}")
+    resp = requests.post(f"{ENV_URL}/apps", json=mcp_config, timeout=300)
+    resp.raise_for_status()
+    log("MCP servers configured")
 
-        # Run agent
-        log("Running agent...")
-        with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
-            orchestrator_config = json.load(f)
+    # Run agent
+    log("Running agent...")
 
-        agent_cmd = [
-            "uv", "run", "python", "-m", "runner.main",
-            "--trajectory-id", trajectory_id,
-            "--initial-messages", str(EXAMPLE_DIR / "initial_messages.json"),
-            "--mcp-gateway-url", f"{env_url}/mcp/",
-            "--agent-config", str(EXAMPLE_DIR / "agent_config.json"),
-            "--orchestrator-model", orchestrator_config["model"],
-            "--output", str(EXAMPLE_DIR / "trajectory.json"),
+    # Load orchestrator config
+    with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
+        orchestrator_config = json.load(f)
+
+    agent_cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "runner.main",
+        "--trajectory-id",
+        trajectory_id,
+        "--initial-messages",
+        str(EXAMPLE_DIR / "initial_messages.json"),
+        "--mcp-gateway-url",
+        f"{ENV_URL}/mcp/",
+        "--agent-config",
+        str(EXAMPLE_DIR / "agent_config.json"),
+        "--orchestrator-model",
+        orchestrator_config["model"],
+        "--output",
+        str(EXAMPLE_DIR / "trajectory.json"),
+    ]
+
+    # Add extra args if present
+    if orchestrator_config.get("extra_args"):
+        extra_args_file = EXAMPLE_DIR / "orchestrator_extra_args.json"
+        with open(extra_args_file, "w") as f:
+            json.dump(orchestrator_config["extra_args"], f)
+        agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
+
+    env_vars = os.environ.copy()
+    env_vars["OPENAI_API_KEY"] = "dummy"
+    env_vars["OPENAI_API_BASE"] = VLLM_URL
+
+    result = subprocess.run(agent_cmd, cwd=AGENTS_DIR, env=env_vars)
+    if result.returncode != 0:
+        log(f"WARNING: Agent exited with code {result.returncode}")
+
+    # Check agent status
+    trajectory_file = EXAMPLE_DIR / "trajectory.json"
+    agent_status = None
+    if trajectory_file.exists():
+        with open(trajectory_file) as f:
+            trajectory = json.load(f)
+            agent_status = trajectory.get("status")
+            log(f"Agent status: {agent_status}")
+
+    # Save final snapshot
+    log("Saving final snapshot...")
+    resp = requests.post(f"{ENV_URL}/data/snapshot", stream=True, timeout=120)
+    resp.raise_for_status()
+
+    final_tar_gz = EXAMPLE_DIR / "final_snapshot.tar.gz"
+    with open(final_tar_gz, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+
+    final_zip = tar_gz_to_zip(final_tar_gz)
+    log(f"Saved: {final_zip}")
+
+    # Run grading if agent completed
+    if agent_status != "completed":
+        log(f"Skipping grading (agent status: {agent_status})")
+    else:
+        log("Running grading...")
+        grading_cmd = [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "runner.main",
+            "--grading-run-id",
+            grading_run_id,
+            "--trajectory-id",
+            trajectory_id,
+            "--initial-snapshot",
+            str(EXAMPLE_DIR / "original_snapshot.zip"),
+            "--final-snapshot",
+            str(final_zip),
+            "--trajectory",
+            str(trajectory_file),
+            "--grading-settings",
+            str(EXAMPLE_DIR / "grading_settings.json"),
+            "--verifiers",
+            str(EXAMPLE_DIR / "verifiers.json"),
+            "--eval-configs",
+            str(EXAMPLE_DIR / "eval_configs.json"),
+            "--scoring-config",
+            str(EXAMPLE_DIR / "scoring_config.json"),
+            "--output",
+            str(EXAMPLE_DIR / "grades.json"),
         ]
 
-        if orchestrator_config.get("extra_args"):
-            extra_args_file = EXAMPLE_DIR / "orchestrator_extra_args.json"
-            with open(extra_args_file, "w") as f:
-                json.dump(orchestrator_config["extra_args"], f)
-            agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
-
-        env_vars = os.environ.copy()
-        env_vars["OPENAI_API_KEY"] = "dummy"
-        env_vars["OPENAI_API_BASE"] = VLLM_URL
-
-        result = subprocess.run(agent_cmd, cwd=AGENTS_DIR, env=env_vars)
+        result = subprocess.run(grading_cmd, cwd=GRADING_DIR, env=env_vars)
         if result.returncode != 0:
-            log(f"WARNING: Agent exited with code {result.returncode}")
+            log(f"WARNING: Grading exited with code {result.returncode}")
 
-        # Check agent status
-        trajectory_file = EXAMPLE_DIR / "trajectory.json"
-        agent_status = None
-        if trajectory_file.exists():
-            with open(trajectory_file) as f:
-                trajectory = json.load(f)
-                agent_status = trajectory.get("status")
-                log(f"Agent status: {agent_status}")
-
-        # Save final snapshot
-        log("Saving final snapshot...")
-        resp = requests.post(f"{env_url}/data/snapshot", stream=True, timeout=120)
-        resp.raise_for_status()
-
-        final_tar_gz = EXAMPLE_DIR / "final_snapshot.tar.gz"
-        with open(final_tar_gz, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-
-        final_zip = tar_gz_to_zip(final_tar_gz)
-        log(f"Saved: {final_zip}")
-
-        # Run grading if agent completed
-        if agent_status != "completed":
-            log(f"Skipping grading (agent status: {agent_status})")
-        else:
-            log("Running grading...")
-            grading_cmd = [
-                "uv", "run", "python", "-m", "runner.main",
-                "--grading-run-id", grading_run_id,
-                "--trajectory-id", trajectory_id,
-                "--initial-snapshot", str(EXAMPLE_DIR / "original_snapshot.zip"),
-                "--final-snapshot", str(final_zip),
-                "--trajectory", str(trajectory_file),
-                "--grading-settings", str(EXAMPLE_DIR / "grading_settings.json"),
-                "--verifiers", str(EXAMPLE_DIR / "verifiers.json"),
-                "--eval-configs", str(EXAMPLE_DIR / "eval_configs.json"),
-                "--scoring-config", str(EXAMPLE_DIR / "scoring_config.json"),
-                "--output", str(EXAMPLE_DIR / "grades.json"),
-            ]
-
-            result = subprocess.run(grading_cmd, cwd=GRADING_DIR, env=env_vars)
-            if result.returncode != 0:
-                log(f"WARNING: Grading exited with code {result.returncode}")
-
-            grades_file = EXAMPLE_DIR / "grades.json"
-            if grades_file.exists():
-                with open(grades_file) as f:
-                    grades = json.load(f)
-                log("=" * 60)
-                log("GRADING RESULTS")
-                log("=" * 60)
-                log(f"Status: {grades.get('grading_run_status')}")
-                log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
-                for vr in grades.get("verifier_results", []):
-                    log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
-
-    finally:
-        log("Terminating Modal sandbox...")
-        sandbox.terminate()
-        log("Sandbox terminated.")
+        # Display results
+        grades_file = EXAMPLE_DIR / "grades.json"
+        if grades_file.exists():
+            with open(grades_file) as f:
+                grades = json.load(f)
+            log("=" * 60)
+            log("GRADING RESULTS")
+            log("=" * 60)
+            log(f"Status: {grades.get('grading_run_status')}")
+            log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
+            for vr in grades.get("verifier_results", []):
+                log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
 
     log("=" * 60)
     log("DONE")
