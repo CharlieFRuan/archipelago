@@ -15,7 +15,6 @@ cd ~/default/SkyRL
 uv run --extra fsdp vllm serve Qwen/Qwen3-VL-30B-A3B-Thinking \
   --tensor-parallel-size 8 \
   --enable-auto-tool-choice --tool-call-parser hermes \
-  --enforce-eager \
   --max-model-len 8192 \
   --limit-mm-per-prompt '{"image": 5}'
 ```
