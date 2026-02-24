@@ -55,7 +55,10 @@ def _ignore_filter(path: Path) -> bool:
 def _cleanup_sandbox():
     global _sandbox
     if _sandbox is not None:
-        _sandbox.terminate()
+        try:
+            _sandbox.terminate()
+        except Exception:
+            pass  # May fail during interpreter shutdown; Modal auto-terminates on timeout
         _sandbox = None
 
 
