@@ -245,14 +245,8 @@ def main():
         mcp_config = json.load(f)
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
-    for attempt in range(3):
-        resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
-        if resp.status_code == 200:
-            break
-        log(f"  MCP config attempt {attempt + 1} failed ({resp.status_code}): {resp.text[:500]}")
-        if attempt == 2:
-            resp.raise_for_status()
-        time.sleep(5)
+    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
+    resp.raise_for_status()
     log("MCP servers configured")
 
     # Generate initial messages from HuggingFace task prompt
