@@ -1,3 +1,12 @@
 {
-  "model": "gemini/gemini-3-pro-preview"
+  "model": "openai/Qwen/Qwen3-VL-30B-A3B-Thinking",
+  "extra_args": {
+    "api_base": "http://0.0.0.0:8000/v1",
+    "api_key": "dummy",
+    "extra_body": {
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    }
+  }
 }

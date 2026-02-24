@@ -1,4 +1,12 @@
 {
-  "llm_judge_model": "gemini/gemini-2.5-flash",
-  "llm_judge_extra_args": null
+  "llm_judge_model": "openai/Qwen/Qwen3-VL-30B-A3B-Thinking",
+  "llm_judge_extra_args": {
+    "api_base": "http://0.0.0.0:8000/v1",
+    "api_key": "dummy",
+    "extra_body": {
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    }
+  }
 }

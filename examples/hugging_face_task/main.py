@@ -8,6 +8,7 @@ Usage:
     ./run.sh task_abc123  # Run task by ID
 """
 
+import atexit
 import io
 import json
 import os
@@ -21,6 +22,7 @@ import zipfile
 from pathlib import Path
 
 import httpx
+import modal
 from huggingface_hub import hf_hub_download
 
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
@@ -31,8 +33,11 @@ ENVIRONMENT_DIR = Path(
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
-ENV_URL = os.environ.get("ENV_URL", "http://localhost:8080")
+VLLM_URL = os.environ.get("VLLM_URL", "http://0.0.0.0:8000/v1")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "openai/Qwen/Qwen3-VL-30B-A3B-Thinking")
 HF_DATASET = "mercor/apex-agents"
+
+_sandbox = None
 
 # Default task: Investment Banking World 221 - BBDC/TVPG accretion/dilution sensitivity analysis
 DEFAULT_TASK = "task_9ba58a6197114140877a1df1754d2993"
@@ -42,51 +47,79 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def wait_for_health(url: str, timeout: int = 120) -> bool:
+def _ignore_filter(path: Path) -> bool:
+    """Return True to IGNORE (exclude) files from the Modal build context."""
+    excluded = {".venv", "__pycache__", ".git", ".ruff_cache", ".pytest_cache", ".mypy_cache"}
+    return any(p in excluded for p in path.parts)
+
+
+def _cleanup_sandbox():
+    global _sandbox
+    if _sandbox is not None:
+        try:
+            _sandbox.terminate()
+        except Exception:
+            print(
+                f"WARNING: Failed to terminate sandbox {_sandbox.object_id}. "
+                f"It will auto-terminate after its timeout (30 min).",
+                flush=True,
+            )
+        _sandbox = None
+
+
+atexit.register(_cleanup_sandbox)
+
+
+def wait_for_health(url: str, timeout: int = 180) -> bool:
     """Wait for environment to be healthy."""
     start = time.time()
     while time.time() - start < timeout:
         try:
-            resp = httpx.get(f"{url}/health", timeout=5)
+            resp = httpx.get(f"{url}/health", timeout=10)
             if resp.status_code == 200:
                 return True
         except httpx.RequestError:
             pass
-        time.sleep(1)
+        time.sleep(2)
     return False
 
 
 def start_environment():
-    """Start a fresh environment container (always restarts)."""
-    env_file = ENVIRONMENT_DIR / ".env"
-    env_example = ENVIRONMENT_DIR / ".env.example"
-    if not env_file.exists() and env_example.exists():
-        log("Creating .env from .env.example...")
-        shutil.copy(env_example, env_file)
-    elif not env_file.exists():
-        log("Creating empty .env file...")
-        env_file.touch()
+    """Start the environment in a Modal Sandbox. Returns the tunnel URL."""
+    global _sandbox
 
-    log("Stopping any existing environment containers...")
-    subprocess.run(
-        ["docker", "compose", "down", "-v"], cwd=ENVIRONMENT_DIR, capture_output=True
+    log("Building Modal image from Dockerfile...")
+    image = modal.Image.from_dockerfile(
+        ENVIRONMENT_DIR / "Dockerfile",
+        context_dir=ARCHIPELAGO_DIR,
+        ignore=_ignore_filter,
     )
 
-    log("Building and starting environment container...")
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--build"], cwd=ENVIRONMENT_DIR
+    app = modal.App.lookup("archipelago-env", create_if_missing=True)
+
+    log("Creating Modal sandbox...")
+    _sandbox = modal.Sandbox.create(
+        "uv", "run", "uvicorn", "runner.main:app",
+        "--host", "0.0.0.0", "--port", "8080",
+        app=app,
+        image=image,
+        encrypted_ports=[8080],
+        cpu=4,
+        memory=8192,
+        timeout=60 * 60,
     )
-    if result.returncode != 0:
-        log("ERROR: Failed to start environment")
-        sys.exit(1)
+    log(f"Sandbox created: {_sandbox.object_id}")
+
+    env_url = _sandbox.tunnels()[8080].url
+    log(f"Environment URL: {env_url}")
 
     log("Waiting for environment to be healthy...")
-    if not wait_for_health(ENV_URL):
-        subprocess.run(["docker", "compose", "logs"], cwd=ENVIRONMENT_DIR)
+    if not wait_for_health(env_url):
         log("ERROR: Environment failed to start")
         sys.exit(1)
 
     log("Environment started")
+    return env_url
 
 
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
@@ -154,7 +187,7 @@ def main():
     log(f"Prompt: {task['prompt'][:100]}...")
     log("=" * 60)
 
-    start_environment()
+    ENV_URL = start_environment()
 
     # Download and extract world snapshot
     log(f"Downloading world snapshot: {world_id}")
@@ -212,8 +245,17 @@ def main():
         mcp_config = json.load(f)
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
-    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
-    resp.raise_for_status()
+    # Skip code_execution_server — its proot sandbox library fails in Modal
+    mcp_config["mcpServers"].pop("code_execution_server", None)
+
+    for attempt in range(3):
+        resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
+        if resp.status_code == 200:
+            break
+        log(f"  MCP config attempt {attempt + 1} failed ({resp.status_code}): {resp.text[:500]}")
+        if attempt == 2:
+            resp.raise_for_status()
+        time.sleep(5)
     log("MCP servers configured")
 
     # Generate initial messages from HuggingFace task prompt
@@ -292,7 +334,11 @@ Don't over-explain. Be concise but show your thinking.
             json.dump(orchestrator_config["extra_args"], f)
         agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
 
-    result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
+    env_vars = os.environ.copy()
+    env_vars["OPENAI_API_KEY"] = "dummy"
+    env_vars["OPENAI_API_BASE"] = VLLM_URL
+
+    result = subprocess.run(agent_cmd, cwd=AGENTS_DIR, env=env_vars)
     if result.returncode != 0:
         log(f"WARNING: Agent exited with code {result.returncode}")
 
@@ -371,7 +417,7 @@ Don't over-explain. Be concise but show your thinking.
             str(grades_file),
         ]
 
-        result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
+        result = subprocess.run(grading_cmd, cwd=GRADING_DIR, env=env_vars)
         if result.returncode != 0:
             log(f"WARNING: Grading exited with code {result.returncode}")
 
@@ -393,4 +439,5 @@ Don't over-explain. Be concise but show your thinking.
 
 
 if __name__ == "__main__":
-    main()
+    with modal.enable_output():
+        main()
