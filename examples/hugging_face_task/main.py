@@ -139,6 +139,9 @@ def tar_gz_to_zip(tar_gz_path: Path) -> Path:
 
 
 def main():
+    # --------------------------------------------------------------------------------------------
+    # 1. Select task and load metadata from tasks_and_rubrics.json and world_descriptions.json
+    # --------------------------------------------------------------------------------------------
     # Parse task selector from command line (index, task ID, or use default)
     task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
 
@@ -187,9 +190,15 @@ def main():
     log(f"Prompt: {task['prompt'][:100]}...")
     log("=" * 60)
 
+
+    # -----------------------------
+    # 2. Start the environment sandbox
+    # -----------------------------
     ENV_URL = start_environment()
 
-    # Download and extract world snapshot
+    # ------------------------------------------------------------------------------------------------
+    # 3. Download and extract world snapshot, populate the environment with `/data/populate`
+    # ------------------------------------------------------------------------------------------------
     log(f"Downloading world snapshot: {world_id}")
     zip_path = hf_hub_download(
         HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
@@ -239,7 +248,9 @@ def main():
                     sys.exit(1)
                 log(f"  {subsystem}: {resp.json()}")
 
-    # Configure MCP servers using the all-servers config
+    # --------------------------------------------------------
+    # 4. Configure MCP servers with `/apps` endpoint
+    # --------------------------------------------------------
     log("Configuring MCP servers...")
     with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
         mcp_config = json.load(f)
@@ -249,6 +260,10 @@ def main():
     resp.raise_for_status()
     log("MCP servers configured")
 
+
+    # ------------------------------------------------------------------------------------------------
+    # 5. Configure the agent (generate initial messages from HuggingFace task prompt, and use orchestrator_config)
+    # ------------------------------------------------------------------------------------------------
     # Generate initial messages from HuggingFace task prompt
     # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
     system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
@@ -296,7 +311,9 @@ Don't over-explain. Be concise but show your thinking.
 
     trajectory_file = output_dir / "trajectory.json"
 
-    # Run agent
+    # ---------------------------------------------
+    # 6. Run the agent with agents/runner/main.py
+    # ---------------------------------------------
     log("Running agent...")
     agent_cmd = [
         "uv",
@@ -333,6 +350,10 @@ Don't over-explain. Be concise but show your thinking.
     if result.returncode != 0:
         log(f"WARNING: Agent exited with code {result.returncode}")
 
+    # ---------------------------------------------
+    # 7. Post-process: Check the agent status and save the final snapshot
+    # ---------------------------------------------
+
     agent_status = None
     if trajectory_file.exists():
         with open(trajectory_file) as f:
@@ -352,7 +373,9 @@ Don't over-explain. Be concise but show your thinking.
     final_zip = tar_gz_to_zip(final_tar_gz)
     log(f"Saved: {final_zip}")
 
-    # Run grading if agent completed
+    # ---------------------------------------------
+    # 8. Run grading if agent completed
+    # ---------------------------------------------
     if agent_status != "completed":
         log(f"Skipping grading (agent status: {agent_status})")
     else:
